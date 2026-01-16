@@ -61,63 +61,49 @@ def init_auth():
 
 @st.cache_data(ttl=3600*24*7, show_spinner=False)
 def fetch_single_ticker(ticker, period="5y"):
-    return yf.download(ticker, period=period, auto_adjust=True, progress=False)
+    # Attempt to download up to 3 times
+    for attempt in range(3):
+        try:
+            data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
+            if not data.empty:
+                return data
+        except Exception as e:
+            if attempt == 2: # Last attempt
+                st.error(f"Final attempt failed for {ticker}: {e}")
+            time.sleep(2) # Wait 2 seconds before retrying
+    return pd.DataFrame() # Return empty if all attempts fail
 
 # ── Fast data caching & pre-alignment ────────────────────────────────────────
-@st.cache_data(ttl=3600*24, show_spinner=False)  # cache 1 day is fine now
+@st.cache_data(ttl=3600*24, show_spinner=False)
 def prepare_aligned_data(stocks, market_tickers):
-    cached_data = load_cached_data()
+    # Streamlit Cloud doesn't persist files well, so we rely on st.cache_data
+    # and download only what is missing from the current session's cache.
+    all_tickers = list(set(stocks + market_tickers))
     
-    all_tickers = set(stocks + market_tickers)
-    needed = all_tickers - set(cached_data.keys())
-    
-    if needed:
-        st.info(f"Downloading new/updated data for: {', '.join(needed)}")
-        new_data = {t: fetch_single_ticker(t) for t in needed}
-        cached_data.update(new_data)
-        save_cached_data(cached_data)
-    raw_data = {t: fetch_single_ticker(t) for t in all_tickers}
-
-    common_index = None
-    for df in raw_data.values():
-        if common_index is None:
-            common_index = df.index
-        else:
-            common_index = common_index.intersection(df.index)
-
-    common_index = common_index.sort_values()
-
-    aligned = {}
-    for t in all_tickers:
-        df = raw_data[t].loc[common_index].copy()
-        
-        # Handle MultiIndex from yfinance (most important fix)
-        if isinstance(df.columns, pd.MultiIndex):
-            # Flatten to single level by taking the first level (price type)
-            df.columns = df.columns.get_level_values(0)
-        else:
-            # Single ticker case - already flat
-            pass
-        
-        # Now columns are flat: 'Open', 'High', 'Low', 'Close', 'Volume'
-        
-        # Fallback if 'Close' still missing
-        price_col = "Close"
-        if price_col not in df.columns:
-            if "Adj Close" in df.columns:
-                df["Close"] = df["Adj Close"]
+    # Download all at once - yfinance is faster with a list
+    try:
+        raw_data = yf.download(all_tickers, period="5y", auto_adjust=True, progress=False)
+    except Exception as e:
+        st.error(f"Global download failure: {e}")
+        return {}    
+    # Handle the MultiIndex columns if multiple tickers were downloaded
+    aligned_dict = {}
+    for ticker in all_tickers:
+        try:
+            # Extract data for this specific ticker from the bulk result
+            if len(all_tickers) > 1:
+                df = raw_data.xs(ticker, axis=1, level=1).dropna(how='all')
             else:
-                raise ValueError(f"No price column for {t}. Available: {df.columns.tolist()}")
-        
-        df["Close"] = df["Close"].astype(float).ffill().bfill()
-        
-        # Keep only needed columns
-        df = df[["Open", "High", "Low", "Close", "Volume"]]
-        aligned[t] = df
-
-    print("Prepared tickers:", list(aligned.keys()))
-    
-    return aligned
+                df = raw_data.dropna(how='all')
+            
+            if not df.empty:
+                # Clean up the data
+                df = df.ffill().bfill()
+                aligned_dict[ticker] = df
+        except KeyError:
+            continue
+            
+    return aligned_dict
 
 # ── Fast CV using Prophet built-in ───────────────────────────────────────────
 @st.cache_data(ttl=3600)
@@ -785,7 +771,13 @@ def main_app():
         stocks = ["TSLA", "MSFT", "NVDA", "GOOG", "AAPL", "AMZN", "AVGO", "CRWD"]
 
     with st.spinner("Downloading & aligning market data... (may take 30–90 seconds on first run)"):
+        # 1. Prepare data quietly in the background
         df_dict = prepare_aligned_data(stocks, market_tickers)
+
+        # 2. Check if data was actually loaded to prevent crashes later
+        if not df_dict:
+            st.error("Failed to load market data. Please check your internet connection or ticker symbols.")
+            st.stop()
         print("df_dict prepared with keys:", list(df_dict.keys()))
         progress_bar = st.progress(0)
         status_text = st.empty()
@@ -802,7 +794,7 @@ def main_app():
                 st.warning(f"Failed {t}: {e}")
             progress_bar.progress((i + 1) / total)
         
-        status_text.text("Aligning common dates...")
+        #status_text.text("Aligning common dates...")
 
     hp = {"cps": 0.05, "sps": 10}
     run_tune = st.sidebar.checkbox("Auto-tune Prophet (faster now)", False)
@@ -813,7 +805,6 @@ def main_app():
         st.success("Data refreshed")
 
     if st.sidebar.button("🔥 Run Full Analysis", key="run_analysis"):
-        forecast_multivariate_cached.clear()  # optional
 
         for symbol in stocks:
             # Safe place for the print
@@ -945,6 +936,7 @@ def main_app():
                         st.info(f"Overall: **Good accuracy** (avg MAPE {avg_mape:.1%}) → usable for short-term")
                     else:
                         st.warning(f"Overall: **Moderate accuracy** (avg MAPE {avg_mape:.1%}) → use with caution")
+
                 rsi_rows = []
                 for period in [3, 5, 7, 9, 14, 21]:
                     val = rsi.get(period, np.nan)
