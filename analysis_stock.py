@@ -59,19 +59,33 @@ def init_auth():
         if k not in st.session_state:
             st.session_state[k] = False if k != "username" else None
 
+@st.cache_data(ttl=3600*24, show_spinner=False)
+def fetch_market_only(market_tickers, period="5y"):
+    """Download only market indices; never crash."""
+    try:
+        raw = yf.download(list(market_tickers), period=period, auto_adjust=True, progress=False)
+        if raw.empty:
+            return {}
+        # Multi-index → dict
+        return {t: raw.xs(t, axis=1, level=1).ffill().bfill()
+                for t in market_tickers if t in raw.columns.get_level_values(1)}
+    except Exception as e:
+        st.warning(f"Market download failed: {e}")
+        return {}
+
 @st.cache_data(ttl=3600*24*7, show_spinner=False)
 def fetch_single_ticker(ticker, period="5y"):
-    # Attempt to download up to 3 times
+    """Never crash; return empty DF if Yahoo blocks us."""
     for attempt in range(3):
         try:
             data = yf.download(ticker, period=period, auto_adjust=True, progress=False)
             if not data.empty:
                 return data
         except Exception as e:
-            if attempt == 2: # Last attempt
-                st.error(f"Final attempt failed for {ticker}: {e}")
-            time.sleep(2) # Wait 2 seconds before retrying
-    return pd.DataFrame() # Return empty if all attempts fail
+            if attempt == 2:          # last attempt
+                st.warning(f"Yahoo block for {ticker}: {e}")
+        time.sleep(2)                 # polite pause
+    return pd.DataFrame()    # Return empty if all attempts fail
 
 # ── Fast data caching & pre-alignment ────────────────────────────────────────
 @st.cache_data(ttl=3600*24, show_spinner=False)
@@ -766,9 +780,19 @@ def main_app():
     )
     market_tickers = market_indices
 
+    with st.spinner("Pre-loading market data …"):
+        market_dict = fetch_market_only(market_tickers)
+
+    if not market_dict:
+        st.error("❌ Could not download market indices.  Check internet or ticker names.")
+        st.stop()
+
     stocks = [s.strip() for s in user_input.split(",") if s.strip()]
     if not stocks:
         stocks = ["TSLA", "MSFT", "NVDA", "GOOG", "AAPL", "AMZN", "AVGO", "CRWD"]
+
+    hp = {"cps": 0.05, "sps": 10}  # default
+    run_tune = st.sidebar.checkbox("Auto-tune Prophet (faster now)", False, key="auto_tune")
 
     with st.spinner("Downloading & aligning market data... (may take 30–90 seconds on first run)"):
         # 1. Prepare data quietly in the background
@@ -785,14 +809,14 @@ def main_app():
         all_tickers = set(stocks + market_tickers)
         total = len(all_tickers)
         
-        raw_data = {}
-        for i, t in enumerate(all_tickers):
-            status_text.text(f"Downloading {t} ({i+1}/{total})...")
-            try:
-                raw_data[t] = fetch_single_ticker(t)
-            except Exception as e:
-                st.warning(f"Failed {t}: {e}")
-            progress_bar.progress((i + 1) / total)
+        #raw_data = {}
+        #for i, t in enumerate(all_tickers):
+        #    status_text.text(f"Downloading {t} ({i+1}/{total})...")
+        #    try:
+        #        raw_data[t] = fetch_single_ticker(t)
+        #    except Exception as e:
+        #        st.warning(f"Failed {t}: {e}")
+        #    progress_bar.progress((i + 1) / total)
         
         #status_text.text("Aligning common dates...")
 
