@@ -1,6 +1,8 @@
 streamlit
 yfinance
 pandas
-prophet
 numpy
 plotly
+statsmodels
+cmdstanpy==1.2.0
+prophet==1.1.5
